@@ -20,18 +20,23 @@
     "default": 10000
   },
   "alert_scope": {
-    "description": "警告监控范围（main/all/custom）",
+    "description": "警告监控范围",
     "type": "string",
     "default": "main"
   },
   "alert_custom_sessions": {
-    "description": "自定义会话 ID 列表（逗号分隔）",
+    "description": "自定义会话 ID 列表",
     "type": "string",
     "default": ""
   },
   "alert_step_pct": {
-    "description": "越过警告阈值后再次触发警告的水位上升百分比",
+    "description": "越阈值后再次告警上升%",
     "type": "int",
     "default": 5
+  },
+  "context_limit": {
+    "description": "上下文上限，0=自动",
+    "type": "int",
+    "default": 0
   }
 }

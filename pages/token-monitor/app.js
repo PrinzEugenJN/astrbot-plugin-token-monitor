@@ -15,6 +15,7 @@
     historyScope: "focus",
     focusConvId: null,
     conversations: [],
+    turnConfig: null,
     conversationsLoaded: false,
     trendLoaded: false,
     refreshInProgress: false,
@@ -40,6 +41,7 @@
     mainPercent: document.querySelector("#main-percent"),
     mainProgress: document.querySelector("#main-progress"),
     mainProgressFill: document.querySelector("#main-progress-fill"),
+    mainTurns: document.querySelector("#main-turns"),
     conversationCount: document.querySelector("#conversation-count"),
     conversationEmpty: document.querySelector("#conversation-empty"),
     conversationGrid: document.querySelector("#conversation-grid"),
@@ -192,8 +194,28 @@
       isMain:
         Boolean(item?.is_main) ||
         (item?.platform_id === MAIN_PLATFORM_ID && item?.user_id === MAIN_USER_ID),
+      turns: Math.max(0, asNumber(item?.turns)),
       updatedAt: item?.updated_at,
     };
+  }
+
+  function renderTurnLine(conversation) {
+    if (!dom.mainTurns) return;
+    const turnConfig = state.turnConfig;
+    if (!turnConfig || !conversation) {
+      dom.mainTurns.textContent = "--";
+      return;
+    }
+    const turns = conversation.turns;
+    const maxTurns = asNumber(turnConfig.max_turns, -1);
+    if (turnConfig.strategy === "truncate_by_turns" && maxTurns > 0) {
+      const left = Math.max(0, maxTurns - turns);
+      dom.mainTurns.textContent = `轮数 ${turns} / ${maxTurns} · 还剩 ${left} 轮`;
+    } else if (turnConfig.strategy === "truncate_by_turns") {
+      dom.mainTurns.textContent = `轮数 ${turns} · 未设轮数上限`;
+    } else {
+      dom.mainTurns.textContent = `按 Token 压缩 · 当前 ${turns} 轮`;
+    }
   }
 
   function renderFocusConversation(conversation) {
@@ -315,6 +337,7 @@
           ? "已达到压缩区间"
           : `剩 ${formatCompact(conversation.remainingToCompress)}`,
       ),
+      createElement("span", "card-turns", `${conversation.turns} 轮`),
       createElement("span", `status-badge ${waterState}`, statusText),
     );
 
@@ -329,6 +352,8 @@
     const conversations = rawConversations
       .map(normalizeConversation)
       .sort((left, right) => right.tokenUsage - left.tokenUsage);
+
+    state.turnConfig = payload?.turn_config || null;
 
     dom.conversationCount.textContent = String(conversations.length);
     dom.conversationEmpty.hidden = conversations.length > 0;
@@ -352,6 +377,7 @@
       }
     }
     renderFocusConversation(focus);
+    renderTurnLine(focus);
   }
 
   async function loadConversations() {
@@ -761,6 +787,7 @@
     warning: { icon: "⚠️", label: "警告", className: "history-warning" },
     cleared: { icon: "✅", label: "解除", className: "history-cleared" },
     compressed: { icon: "📉", label: "压缩", className: "history-compressed" },
+    rollback: { icon: "🌊", label: "回落", className: "history-rollback" },
   };
 
   function renderHistory(payload) {

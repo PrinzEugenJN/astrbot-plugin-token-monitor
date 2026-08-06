@@ -337,8 +337,9 @@ class TokenMonitorPlugin(Star):
         session_str = self.config.get(
             "alert_target_session", "default:FriendMessage:256418297"
         )
+        context_limit = self._resolve_context_limit()
         compress_threshold_tokens = (
-            CONTEXT_LIMIT * COMPRESS_THRESHOLD_PCT // 100
+            context_limit * COMPRESS_THRESHOLD_PCT // 100
         )
 
         for row in monitored_rows:
@@ -348,7 +349,7 @@ class TokenMonitorPlugin(Star):
 
             conversation_id = row["conversation_id"]
             title = row["title"] or conversation_id[:8]
-            percent = round(token_usage / CONTEXT_LIMIT * 100, 2)
+            percent = round(token_usage / context_limit * 100, 2)
             state = self._alert_state.setdefault(
                 conversation_id,
                 {"last_alert_pct": None, "last_token_usage": None},
@@ -362,7 +363,7 @@ class TokenMonitorPlugin(Star):
                 remaining = max(0, compress_threshold_tokens - token_usage)
                 text = (
                     f"⚠️ Token 水位警告：{title} 当前 {percent}%"
-                    f"（{token_usage:,}/{CONTEXT_LIMIT:,}），距压缩阈值 "
+                    f"（{token_usage:,}/{context_limit:,}），距压缩阈值 "
                     f"{COMPRESS_THRESHOLD_PCT}% 还差 {remaining:,} tokens"
                 )
                 try:
@@ -383,7 +384,7 @@ class TokenMonitorPlugin(Star):
             elif last_alert_pct is not None and percent < ALERT_THRESHOLD_PCT:
                 text = (
                     f"✅ Token 水位警告已解除：{title} 当前 {percent}%"
-                    f"（{token_usage:,}/{CONTEXT_LIMIT:,}），低于警告阈值 "
+                    f"（{token_usage:,}/{context_limit:,}），低于警告阈值 "
                     f"{ALERT_THRESHOLD_PCT}%"
                 )
                 try:
@@ -402,16 +403,20 @@ class TokenMonitorPlugin(Star):
                         conversation_id, title, "cleared", percent, token_usage
                     )
 
-            # 压缩检测：水位从高位骤降视为发生上下文压缩
+            # 压缩/回落检测：水位骤降视为压缩事件，中等降幅视为清理回落
             last_usage = state.get("last_token_usage")
             if (
                 last_usage is not None
-                and last_usage > CONTEXT_LIMIT * 30 // 100
-                and token_usage < last_usage * 0.6
+                and last_usage > context_limit * 30 // 100
             ):
-                self._record_history(
-                    conversation_id, title, "compressed", percent, token_usage
-                )
+                if token_usage < last_usage * 0.6:
+                    self._record_history(
+                        conversation_id, title, "compressed", percent, token_usage
+                    )
+                elif token_usage < last_usage * 0.85:
+                    self._record_history(
+                        conversation_id, title, "rollback", percent, token_usage
+                    )
             state["last_token_usage"] = token_usage
             self._persist_monitor_state(conversation_id, state)
 
@@ -426,9 +431,10 @@ class TokenMonitorPlugin(Star):
                         title,
                         platform_id,
                         user_id,
+                        content,
                         COALESCE(token_usage, 0) AS token_usage,
                         created_at,
-                        updated_at
+                    updated_at
                     FROM conversations
                     ORDER BY COALESCE(token_usage, 0) DESC, updated_at DESC
                     """
@@ -447,15 +453,18 @@ class TokenMonitorPlugin(Star):
                             current_main_conv = None
                         break
 
-            compress_threshold_tokens = (
-                CONTEXT_LIMIT * COMPRESS_THRESHOLD_PCT // 100
-            )
             conversations = []
+            context_limit = self._resolve_context_limit()
+            turn_config = self._resolve_turn_config()
+            compress_threshold_tokens = (
+                context_limit * COMPRESS_THRESHOLD_PCT // 100
+            )
             for row in rows:
                 token_usage = max(0, int(row["token_usage"] or 0))
                 remaining_to_compress = max(
                     0, compress_threshold_tokens - token_usage
                 )
+                turns = self._count_turns(row["content"])
                 conversations.append(
                     {
                         "conversation_id": row["conversation_id"],
@@ -466,14 +475,14 @@ class TokenMonitorPlugin(Star):
                         "platform_id": row["platform_id"],
                         "user_id": row["user_id"],
                         "token_usage": token_usage,
-                        "percent": round(token_usage / CONTEXT_LIMIT * 100, 2),
+                        "percent": round(token_usage / context_limit * 100, 2),
                         "remaining_to_compress": remaining_to_compress,
                         "over_compress_threshold": (
                             token_usage >= compress_threshold_tokens
                         ),
                         "alerting": (
                             token_usage
-                            >= CONTEXT_LIMIT * ALERT_THRESHOLD_PCT // 100
+                            >= context_limit * ALERT_THRESHOLD_PCT // 100
                         ),
                         "is_main": (
                             row["platform_id"] == MAIN_PLATFORM_ID
@@ -483,6 +492,7 @@ class TokenMonitorPlugin(Star):
                                 or row["conversation_id"] == current_main_conv
                             )
                         ),
+                        "turns": turns,
                         "created_at": row["created_at"],
                         "updated_at": row["updated_at"],
                     }
@@ -493,9 +503,10 @@ class TokenMonitorPlugin(Star):
                     "status": "ok",
                     "message": "",
                     "data": {
-                        "context_limit": CONTEXT_LIMIT,
+                        "context_limit": context_limit,
                         "compress_threshold_pct": COMPRESS_THRESHOLD_PCT,
                         "alert_threshold_pct": ALERT_THRESHOLD_PCT,
+                        "turn_config": turn_config,
                         "count": len(conversations),
                         "conversations": conversations,
                     },
@@ -628,6 +639,59 @@ class TokenMonitorPlugin(Star):
                 status_code=503,
                 data={"code": "database_unavailable"},
             )
+
+    @staticmethod
+    def _cmd_config_path() -> Path:
+        """AstrBot 主配置文件路径（插件部署目录 parents[2] 为 data/）"""
+        return Path(__file__).resolve().parents[2] / "cmd_config.json"
+
+    def _resolve_context_limit(self) -> int:
+        """上下文限制：插件配置 context_limit>0 优先，否则读 AstrBot provider 配置自动解析。"""
+        cfg_limit = int(self.config.get("context_limit", 0) or 0)
+        if cfg_limit > 0:
+            return cfg_limit
+        try:
+            with open(self._cmd_config_path(), "r", encoding="utf-8-sig") as f:
+                cmd = json.load(f)
+            ps = cmd.get("provider_settings", {})
+            default_id = ps.get("default_provider_id", "")
+            fallback = int(ps.get("fallback_max_context_tokens", 0) or 128000)
+            fallback = fallback if fallback > 0 else 128000
+            for p in cmd.get("provider", []):
+                if p.get("id") == default_id:
+                    mct = int(p.get("max_context_tokens", 0) or 0)
+                    return mct if mct > 0 else fallback
+            return fallback
+        except Exception as exc:
+            logger.warning("读取上下文限制失败，使用默认 1M: %s", exc)
+            return CONTEXT_LIMIT
+
+    def _resolve_turn_config(self) -> dict:
+        """轮数截断配置：策略 / 最大轮数 / 每次移除轮数。"""
+        try:
+            with open(self._cmd_config_path(), "r", encoding="utf-8-sig") as f:
+                cmd = json.load(f)
+            ps = cmd.get("provider_settings", {})
+            return {
+                "strategy": ps.get("context_limit_reached_strategy", "llm_compress"),
+                "max_turns": int(ps.get("max_context_length", -1) or -1),
+                "dequeue_turns": int(ps.get("dequeue_context_length", 10) or 10),
+            }
+        except Exception:
+            return {"strategy": "llm_compress", "max_turns": -1, "dequeue_turns": 10}
+
+    @staticmethod
+    def _count_turns(content) -> int:
+        """从会话 content 中统计轮数（user 消息条数）。"""
+        if not content:
+            return 0
+        try:
+            messages = json.loads(content)
+            if not isinstance(messages, list):
+                return 0
+            return sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user")
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _resolve_display_name(title, user_id):

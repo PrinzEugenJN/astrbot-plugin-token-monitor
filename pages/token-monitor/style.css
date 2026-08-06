@@ -969,6 +969,11 @@ summary:focus-visible {
   color: var(--caution);
 }
 
+.history-item.history-rollback .history-type {
+  background: rgba(90, 138, 210, 0.12);
+  color: #7fa8e0;
+}
+
 .history-item .history-title {
   flex: 1 1 auto;
   min-width: 0;
@@ -1894,6 +1899,20 @@ summary:focus-visible {
     opacity: 1;
     transform: rotate(18deg) translateY(0);
   }
+}
+
+/* ══ 轮数区块 ══ */
+.turns-line {
+  margin: 10px 0 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+}
+.card-turns {
+  flex: none;
+  color: var(--text-faint);
+  font-family: var(--mono);
 }
 
 /* 切换按钮滑动指示条 */
