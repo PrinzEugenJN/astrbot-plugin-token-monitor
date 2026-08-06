@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.irmia/
+backup/
+deploy_bak_*/
+*.log
+.DS_Store
+*.tmp
+.*.tmp

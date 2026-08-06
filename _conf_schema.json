@@ -1,0 +1,37 @@
+{
+  "alert_enabled": {
+    "description": "警告总开关",
+    "type": "bool",
+    "default": true
+  },
+  "alert_target_session": {
+    "description": "警告发送目标会话",
+    "type": "string",
+    "default": "default:FriendMessage:256418297"
+  },
+  "check_interval_sec": {
+    "description": "后端水位检查间隔（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "refresh_interval_ms": {
+    "description": "页面轮询间隔（毫秒）",
+    "type": "int",
+    "default": 10000
+  },
+  "alert_scope": {
+    "description": "警告监控范围（main/all/custom）",
+    "type": "string",
+    "default": "main"
+  },
+  "alert_custom_sessions": {
+    "description": "自定义会话 ID 列表（逗号分隔）",
+    "type": "string",
+    "default": ""
+  },
+  "alert_step_pct": {
+    "description": "越过警告阈值后再次触发警告的水位上升百分比",
+    "type": "int",
+    "default": 5
+  }
+}
