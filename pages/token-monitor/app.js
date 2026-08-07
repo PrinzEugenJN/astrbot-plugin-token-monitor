@@ -791,7 +791,7 @@
   };
 
   function renderHistory(payload) {
-    const items = payload?.data?.history || [];
+    const items = payload?.history || payload?.data?.history || [];
     dom.historyEmpty.hidden = items.length > 0;
     dom.historyList.hidden = items.length === 0;
     if (!items.length) return;
