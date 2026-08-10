@@ -10,7 +10,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import MessageChain
+from astrbot.api.all import command
+from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
 
@@ -134,10 +135,18 @@ class TokenMonitorPlugin(Star):
                         conversation_id TEXT PRIMARY KEY,
                         last_alert_pct REAL,
                         last_token_usage INTEGER,
+                        last_turn_pct REAL,
                         updated_at REAL
                     )
                     """
                 )
+                # v0.1.2: 旧库迁移轮数告警状态列
+                try:
+                    connection.execute(
+                        "ALTER TABLE monitor_state ADD COLUMN last_turn_pct REAL"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
                 connection.commit()
         except Exception as exc:
             logger.error("初始化警告历史表失败: %s", exc)
@@ -147,17 +156,23 @@ class TokenMonitorPlugin(Star):
         try:
             with closing(self._open_history_database()) as connection:
                 rows = connection.execute(
-                    "SELECT conversation_id, last_alert_pct, last_token_usage FROM monitor_state"
+                    "SELECT conversation_id, last_alert_pct, last_token_usage, last_turn_pct FROM monitor_state"
                 ).fetchall()
             for row in rows:
                 state = self._alert_state.setdefault(
                     row["conversation_id"],
-                    {"last_alert_pct": None, "last_token_usage": None},
+                    {
+                        "last_alert_pct": None,
+                        "last_token_usage": None,
+                        "last_turn_pct": None,
+                    },
                 )
                 if row["last_alert_pct"] is not None:
                     state["last_alert_pct"] = row["last_alert_pct"]
                 if row["last_token_usage"] is not None:
                     state["last_token_usage"] = row["last_token_usage"]
+                if row["last_turn_pct"] is not None:
+                    state["last_turn_pct"] = row["last_turn_pct"]
         except Exception as exc:
             logger.error("恢复告警状态失败: %s", exc)
 
@@ -168,17 +183,19 @@ class TokenMonitorPlugin(Star):
                 connection.execute(
                     """
                     INSERT INTO monitor_state
-                        (conversation_id, last_alert_pct, last_token_usage, updated_at)
-                    VALUES (?, ?, ?, ?)
+                        (conversation_id, last_alert_pct, last_token_usage, last_turn_pct, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(conversation_id) DO UPDATE SET
                         last_alert_pct = excluded.last_alert_pct,
                         last_token_usage = excluded.last_token_usage,
+                        last_turn_pct = excluded.last_turn_pct,
                         updated_at = excluded.updated_at
                     """,
                     (
                         conversation_id,
                         state.get("last_alert_pct"),
                         state.get("last_token_usage"),
+                        state.get("last_turn_pct"),
                         time.time(),
                     ),
                 )
@@ -280,7 +297,8 @@ class TokenMonitorPlugin(Star):
                     title,
                     platform_id,
                     user_id,
-                    token_usage
+                    token_usage,
+                    content
                 FROM conversations
                 """
             ).fetchall()
@@ -341,6 +359,12 @@ class TokenMonitorPlugin(Star):
         compress_threshold_tokens = (
             context_limit * COMPRESS_THRESHOLD_PCT // 100
         )
+
+        # 轮数告警配置（v0.1.2）
+        turn_config = self._resolve_turn_config()
+        turn_alert_enabled = bool(self.config.get("turn_alert_enabled", True))
+        turn_alert_pct = int(self.config.get("alert_turn_pct", 75))
+        turn_step_pct = int(self.config.get("turn_step_pct", 5))
 
         for row in monitored_rows:
             token_usage = row["token_usage"]
@@ -417,8 +441,144 @@ class TokenMonitorPlugin(Star):
                     self._record_history(
                         conversation_id, title, "rollback", percent, token_usage
                     )
+            # 轮数告警（v0.1.2）：truncate_by_turns 策略下按轮数占比告警
+            if (
+                turn_alert_enabled
+                and turn_config["strategy"] == "truncate_by_turns"
+                and turn_config["max_turns"] > 0
+            ):
+                turns = self._count_turns(row["content"])
+                max_turns = turn_config["max_turns"]
+                if turns > 0:
+                    turn_pct = round(turns / max_turns * 100, 2)
+                    last_turn_pct = state.get("last_turn_pct")
+                    if turn_pct >= turn_alert_pct and (
+                        last_turn_pct is None
+                        or turn_pct >= last_turn_pct + turn_step_pct
+                    ):
+                        remaining_turns = max(0, max_turns - turns)
+                        text = (
+                            f"轮数警告：{title} 当前 {turns}/{max_turns} 轮"
+                            f"（{turn_pct}%），还剩 {remaining_turns} 轮将被截断"
+                        )
+                        try:
+                            await self.context.send_message(
+                                session_str, MessageChain().message(text)
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "轮数警告发送失败（会话 %s）: %s",
+                                conversation_id,
+                                exc,
+                            )
+                        else:
+                            state["last_turn_pct"] = turn_pct
+                            self._record_history(
+                                conversation_id,
+                                title,
+                                "turn_warning",
+                                turn_pct,
+                                turns,
+                            )
+
             state["last_token_usage"] = token_usage
             self._persist_monitor_state(conversation_id, state)
+
+    @command("ctx")
+    async def ctx_cmd(self, event: AstrMessageEvent):
+        """查询当前会话 Token 水位状态。用法：/ctx [history [N]]"""
+        target = str(event.session)
+        parts = event.message_str.strip().split()
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+
+        async def reply(text: str) -> None:
+            await self.context.send_message(
+                target, MessageChain().message(text)
+            )
+
+        if sub == "help":
+            await reply(
+                "用法：/ctx 查看当前会话水位；"
+                "/ctx history [N] 查看最近 N 条告警历史（默认 5）；"
+                "/ctx help 帮助"
+            )
+            event.stop_event()
+            return
+
+        if sub == "history":
+            n = 5
+            if len(parts) > 2 and parts[2].isdigit():
+                n = min(int(parts[2]), 50)
+            try:
+                with closing(self._open_history_database()) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT created_at, title, event_type, percent, token_usage
+                        FROM alert_history
+                        ORDER BY id DESC LIMIT ?
+                        """,
+                        (n,),
+                    ).fetchall()
+            except Exception as exc:
+                logger.error("查询告警历史失败: %s", exc)
+                rows = []
+            if not rows:
+                await reply("暂无告警历史。")
+                event.stop_event()
+                return
+            lines = ["最近告警历史："]
+            for row in rows:
+                ts = time.strftime(
+                    "%m-%d %H:%M", time.localtime(row["created_at"])
+                )
+                lines.append(
+                    f"{ts} [{row['event_type']}] {row['title']} "
+                    f"{row['percent']}%"
+                )
+            await reply("\n".join(lines))
+            event.stop_event()
+            return
+
+        # status：查询当前会话（platform_id + unified_msg_origin 匹配）
+        try:
+            with closing(self._open_readonly_database()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT conversation_id, title, token_usage, content
+                    FROM conversations
+                    WHERE platform_id = ? AND user_id = ?
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (event.platform_meta.id, str(event.session)),
+                ).fetchone()
+        except Exception as exc:
+            logger.error("查询当前会话水位失败: %s", exc)
+            row = None
+        if not row:
+            await reply("未找到当前会话的水位数据。")
+            event.stop_event()
+            return
+
+        context_limit = self._resolve_context_limit()
+        token_usage = row["token_usage"] or 0
+        percent = round(token_usage / context_limit * 100, 2)
+        turn_config = self._resolve_turn_config()
+        lines = [
+            f"会话：{row['title'] or row['conversation_id'][:8]}",
+            f"Token：{token_usage:,} / {context_limit:,}（{percent}%）",
+            f"策略：{turn_config['strategy']}",
+        ]
+        if (
+            turn_config["strategy"] == "truncate_by_turns"
+            and turn_config["max_turns"] > 0
+        ):
+            turns = self._count_turns(row["content"])
+            turn_pct = round(turns / turn_config["max_turns"] * 100, 2)
+            lines.append(
+                f"轮数：{turns} / {turn_config['max_turns']}（{turn_pct}%）"
+            )
+        await reply("\n".join(lines))
+        event.stop_event()
 
     async def get_conversations(self):
         """返回全部会话水位；百分比及阈值余量由后端统一计算。"""

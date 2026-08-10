@@ -788,6 +788,11 @@
     cleared: { icon: "✅", label: "解除", className: "history-cleared" },
     compressed: { icon: "📉", label: "压缩", className: "history-compressed" },
     rollback: { icon: "🌊", label: "回落", className: "history-rollback" },
+    turn_warning: {
+      icon: "📊",
+      label: "轮数",
+      className: "history-turn",
+    },
   };
 
   function renderHistory(payload) {

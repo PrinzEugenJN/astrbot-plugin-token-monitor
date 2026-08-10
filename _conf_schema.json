@@ -34,6 +34,21 @@
     "type": "int",
     "default": 5
   },
+  "turn_alert_enabled": {
+    "description": "轮数告警开关",
+    "type": "bool",
+    "default": true
+  },
+  "alert_turn_pct": {
+    "description": "轮数告警阈值%",
+    "type": "int",
+    "default": 75
+  },
+  "turn_step_pct": {
+    "description": "轮数越阈值后再告警上升%",
+    "type": "int",
+    "default": 5
+  },
   "context_limit": {
     "description": "上下文上限，0=自动",
     "type": "int",
