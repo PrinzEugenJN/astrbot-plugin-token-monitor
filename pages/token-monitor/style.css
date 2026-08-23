@@ -1028,6 +1028,27 @@ summary:focus-visible {
   box-shadow: 0 0 0 1px var(--accent), 0 4px 14px rgb(0 0 0 / 0.08);
 }
 
+/* 旧会话（stale）：置灰弱化，仍可点击查看 */
+.conv-card.conv-stale {
+  opacity: 0.55;
+  filter: grayscale(0.6);
+}
+
+.conv-card.conv-stale:hover {
+  opacity: 0.8;
+  filter: grayscale(0.3);
+}
+
+.conv-card .conv-flag {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .conv-card .card-top {
   display: flex;
   align-items: flex-start;
