@@ -5,6 +5,7 @@ import json
 import sqlite3
 import time
 from collections import defaultdict
+from datetime import datetime
 from contextlib import closing
 from pathlib import Path
 from urllib.parse import quote
@@ -18,6 +19,7 @@ from astrbot.api.web import error_response, json_response, request
 CONTEXT_LIMIT = 1_000_000
 COMPRESS_THRESHOLD_PCT = 82
 ALERT_THRESHOLD_PCT = 75
+DEFAULT_STALE_DAYS = 30
 MAIN_PLATFORM_ID = "default"
 MAIN_USER_ID = "default:FriendMessage:256418297"
 ALLOWED_STATS_DAYS = {1, 3, 7, 30}
@@ -602,18 +604,23 @@ class TokenMonitorPlugin(Star):
 
                 # 主会话判定：以 preferences 中当前选中的会话（sel_conv_id）为准，
                 # 避免多个同用户会话时误选历史僵尸会话。必须在连接关闭前查询。
+                # 同步收集所有 user 的当前会话，用于通用 status 判定（不写死任何 ID）。
+                active_by_scope: dict[str, str] = {}
                 current_main_conv = None
                 for pref_row in connection.execute(
                     "SELECT scope_id, value FROM preferences WHERE key = 'sel_conv_id' AND scope = 'umo'"
                 ).fetchall():
+                    try:
+                        sel_val = json.loads(pref_row["value"]).get("val")
+                    except (TypeError, ValueError):
+                        sel_val = None
+                    if sel_val:
+                        active_by_scope[pref_row["scope_id"]] = sel_val
                     if pref_row["scope_id"] == MAIN_USER_ID:
-                        try:
-                            current_main_conv = json.loads(pref_row["value"]).get("val")
-                        except (TypeError, ValueError):
-                            current_main_conv = None
-                        break
+                        current_main_conv = sel_val
 
             conversations = []
+            stale_days = int(self.config.get("stale_days", DEFAULT_STALE_DAYS) or 0)
             context_limit = self._resolve_context_limit()
             turn_config = self._resolve_turn_config()
             compress_threshold_tokens = (
@@ -625,10 +632,18 @@ class TokenMonitorPlugin(Star):
                     0, compress_threshold_tokens - token_usage
                 )
                 turns = self._count_turns(row["content"])
+                active_conv = active_by_scope.get(row["user_id"])
+                if row["conversation_id"] == active_conv:
+                    session_status = "active"
+                elif stale_days > 0 and self._stale_age_days(row["updated_at"]) > stale_days:
+                    session_status = "stale"
+                else:
+                    session_status = "idle"
                 conversations.append(
                     {
                         "conversation_id": row["conversation_id"],
                         "title": row["title"],
+                        "status": session_status,
                         "display_name": self._resolve_display_name(
                             row["title"], row["user_id"]
                         ),
@@ -667,6 +682,7 @@ class TokenMonitorPlugin(Star):
                         "compress_threshold_pct": COMPRESS_THRESHOLD_PCT,
                         "alert_threshold_pct": ALERT_THRESHOLD_PCT,
                         "turn_config": turn_config,
+                        "stale_days": stale_days,
                         "count": len(conversations),
                         "conversations": conversations,
                     },
@@ -806,7 +822,14 @@ class TokenMonitorPlugin(Star):
         return Path(__file__).resolve().parents[2] / "cmd_config.json"
 
     def _resolve_context_limit(self) -> int:
-        """上下文限制：插件配置 context_limit>0 优先，否则读 AstrBot provider 配置自动解析。"""
+        """上下文限制（自动探测，纯检测不写死任何模型值）。
+        与 AstrBot 主 agent 的判定顺序保持一致（源码 @1678）：
+        ① 插件自身 context_limit(用户显式指定) > ② 默认 provider 的
+            max_context_tokens(用户手改) > ③ LLM_METADATAS[model](模型默认，
+            AstrBot 实际用的) > ④ provider_settings.fallback_max_context_tokens
+            (兜底值，仅当模型查不到默认时才用) > ⑤ 内置 128000。
+        用户显式设置优先，模型默认次之，兜底值只兜查不到的；随换模型自动跟。
+        """
         cfg_limit = int(self.config.get("context_limit", 0) or 0)
         if cfg_limit > 0:
             return cfg_limit
@@ -815,13 +838,32 @@ class TokenMonitorPlugin(Star):
                 cmd = json.load(f)
             ps = cmd.get("provider_settings", {})
             default_id = ps.get("default_provider_id", "")
-            fallback = int(ps.get("fallback_max_context_tokens", 0) or 128000)
-            fallback = fallback if fallback > 0 else 128000
-            for p in cmd.get("provider", []):
-                if p.get("id") == default_id:
-                    mct = int(p.get("max_context_tokens", 0) or 0)
-                    return mct if mct > 0 else fallback
-            return fallback
+            provider = next(
+                (p for p in cmd.get("provider", []) if p.get("id") == default_id),
+                None,
+            )
+            if provider is not None:
+                mct = int(provider.get("max_context_tokens", 0) or 0)
+                if mct > 0:
+                    return mct
+            if provider is not None:
+                model = provider.get("model") or ""
+                if model:
+                    try:
+                        from astrbot.core.utils.llm_metadata import LLM_METADATAS
+                        info = LLM_METADATAS.get(model)
+                        if (
+                            info
+                            and info.get("limit")
+                            and int(info["limit"].get("context", 0) or 0) > 0
+                        ):
+                            return int(info["limit"]["context"])
+                    except Exception:
+                        pass
+            fallback = int(ps.get("fallback_max_context_tokens", 0) or 0)
+            if fallback > 0:
+                return fallback
+            return 128000
         except Exception as exc:
             logger.warning("读取上下文限制失败，使用默认 1M: %s", exc)
             return CONTEXT_LIMIT
@@ -839,6 +881,18 @@ class TokenMonitorPlugin(Star):
             }
         except Exception:
             return {"strategy": "llm_compress", "max_turns": -1, "dequeue_turns": 10}
+
+    @staticmethod
+    def _stale_age_days(updated_at: str) -> int:
+        """会话距今冻结天数（UTC），解析失败返回 0。"""
+        try:
+            dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S.%f")
+        except (TypeError, ValueError):
+            try:
+                dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                return 0
+        return (datetime.utcnow() - dt).days
 
     @staticmethod
     def _count_turns(content) -> int:
