@@ -1,6 +1,7 @@
 (() => {
   "use strict";
 
+  // 兜底上下文上限（后端解析失败时才使用；正常由接口返回 context_limit 覆盖）
   const CONTEXT_LIMIT = 1_000_000;
   const COMPRESS_THRESHOLD_PCT = 82;
   const ALERT_THRESHOLD_PCT = 75;
@@ -16,6 +17,7 @@
     focusConvId: null,
     conversations: [],
     turnConfig: null,
+    contextLimit: CONTEXT_LIMIT,
     conversationsLoaded: false,
     trendLoaded: false,
     refreshInProgress: false,
@@ -39,6 +41,7 @@
     mainUpdatedAt: document.querySelector("#main-updated-at"),
     mainRemaining: document.querySelector("#main-remaining"),
     mainPercent: document.querySelector("#main-percent"),
+    mainContextLimit: document.querySelector("#main-context-limit"),
     mainProgress: document.querySelector("#main-progress"),
     mainProgressFill: document.querySelector("#main-progress-fill"),
     mainTurns: document.querySelector("#main-turns"),
@@ -171,7 +174,7 @@
     const tokenUsage = Math.max(0, asNumber(item?.token_usage));
     const percent = Number.isFinite(Number(item?.percent))
       ? Number(item.percent)
-      : (tokenUsage / CONTEXT_LIMIT) * 100;
+      : (tokenUsage / state.contextLimit) * 100;
     return {
       conversationId: String(item?.conversation_id || ""),
       title: String(item?.title || "未命名会话"),
@@ -184,7 +187,7 @@
         0,
         asNumber(
           item?.remaining_to_compress,
-          (CONTEXT_LIMIT * COMPRESS_THRESHOLD_PCT) / 100 - tokenUsage,
+          (state.contextLimit * COMPRESS_THRESHOLD_PCT) / 100 - tokenUsage,
         ),
       ),
       overCompressThreshold:
@@ -196,6 +199,7 @@
         (item?.platform_id === MAIN_PLATFORM_ID && item?.user_id === MAIN_USER_ID),
       turns: Math.max(0, asNumber(item?.turns)),
       updatedAt: item?.updated_at,
+      status: String(item?.status || "active"),
     };
   }
 
@@ -287,6 +291,9 @@
   function buildConversationCard(conversation) {
     const card = createElement("div", "conv-card");
     card.dataset.conversationId = conversation.conversationId;
+    if (conversation.status === "stale") {
+      card.classList.add("conv-stale");
+    }
     if (conversation.conversationId === state.focusConvId) {
       card.classList.add("focused");
     }
@@ -300,13 +307,19 @@
 
     const top = createElement("div", "card-top");
     const nameWrap = createElement("div");
+    const statusPrefix =
+      conversation.status === "stale"
+        ? "🕓 "
+        : conversation.status === "idle"
+          ? "💤 "
+          : "";
     nameWrap.append(
       createElement(
         "div",
         "card-name",
         conversation.isMain
           ? `⭐ ${conversation.displayName}`
-          : conversation.displayName,
+          : `${statusPrefix}${conversation.displayName}`,
       ),
       createElement(
         "div",
@@ -329,6 +342,9 @@
     bar.appendChild(barFill);
 
     const footer = createElement("div", "card-footer");
+    if (conversation.status === "stale") {
+      footer.append(createElement("span", "conv-flag", "旧会话"));
+    }
     footer.append(
       createElement(
         "span",
@@ -351,9 +367,17 @@
       : [];
     const conversations = rawConversations
       .map(normalizeConversation)
-      .sort((left, right) => right.tokenUsage - left.tokenUsage);
+      .sort((left, right) => {
+        const order = { active: 0, idle: 1, stale: 2 };
+        const diff = (order[left.status] ?? 1) - (order[right.status] ?? 1);
+        return diff !== 0 ? diff : right.tokenUsage - left.tokenUsage;
+      });
 
     state.turnConfig = payload?.turn_config || null;
+    state.contextLimit = asNumber(payload?.context_limit, CONTEXT_LIMIT);
+    if (dom.mainContextLimit) {
+      dom.mainContextLimit.textContent = `/ ${formatNumber(state.contextLimit)}`;
+    }
 
     dom.conversationCount.textContent = String(conversations.length);
     dom.conversationEmpty.hidden = conversations.length > 0;
