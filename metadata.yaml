@@ -2,5 +2,4 @@ name: token_monitor
 display_name: Token 水位监控
 desc: 在 AstrBot Dashboard 中监控各会话的上下文 Token 水位，并在接近压缩阈值时主动推送水位警告。
 author: 林 & 欧根亲王 (Prinz Eugen)
-version: 0.1.2
-
+version: 0.2.0
