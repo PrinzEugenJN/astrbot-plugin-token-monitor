@@ -50,8 +50,13 @@
     "default": 5
   },
   "context_limit": {
-    "description": "上下文上限，0=自动",
+    "description": "上下文上限（越高越晚触发告警）。留空或不填则自动按该模型的上下文/兜底值检测，非必填。",
     "type": "int",
     "default": 0
+  },
+  "stale_days": {
+    "description": "会话冻结多少天后标记为旧会话（0=不标记）",
+    "type": "int",
+    "default": 30
   }
 }
