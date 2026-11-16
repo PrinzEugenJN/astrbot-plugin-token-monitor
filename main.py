@@ -21,13 +21,16 @@ COMPRESS_THRESHOLD_PCT = 82
 ALERT_THRESHOLD_PCT = 75
 DEFAULT_STALE_DAYS = 30
 MAIN_PLATFORM_ID = "default"
-MAIN_USER_ID = "default:FriendMessage:256418297"
 ALLOWED_STATS_DAYS = {1, 3, 7, 30}
 
-# 部署结构为 core/data/plugins/<plugin>/main.py，因此 parents[2] 是 data。
-DEPLOYMENT_DATABASE_FALLBACK = Path(
-    r"C:\Users\欧根亲王\.astrbot_launcher\instances\831b358c-9138-4d35-a73c-bcbcca96e4b8\core\data\data_v4.db"
-)
+# 由 __init__ 从插件配置写入，避免把作者本机的会话标识打进源码。
+# 留空时由 _resolve_main_user_id() 按 Token 用量最高的会话懒推断。
+MAIN_USER_ID = ""
+# AstrBot 核心数据库 data_v4.db 的绝对路径。
+# 由 __init__ 向框架索取（BaseDatabase.DATABASE_URL），拿不到再按部署结构推断。
+_CORE_DB_PATH = ""
+# 主用户标识的推断缓存，避免每次判定都查库。
+_MAIN_USER_CACHE: list[str | None] = [None]
 
 
 class TokenMonitorPlugin(Star):
@@ -38,6 +41,16 @@ class TokenMonitorPlugin(Star):
         self.config = config
         self._alert_task: asyncio.Task | None = None
         self._alert_state: dict[str, dict] = {}
+
+        global MAIN_USER_ID, _CORE_DB_PATH
+        MAIN_USER_ID = str(config.get("main_user_id", "") or "").strip()
+        _MAIN_USER_CACHE[0] = None
+        _CORE_DB_PATH = self._resolve_core_db_path(context)
+        logger.info(
+            "Token 水位监控已加载｜主用户标识=%s｜核心数据库=%s",
+            MAIN_USER_ID or "（留空，按用量最高会话推断）",
+            _CORE_DB_PATH or "（未找到，请检查部署结构）",
+        )
 
     async def initialize(self) -> None:
         """插件激活后注册只读接口并记录加载信息。"""
@@ -67,10 +80,7 @@ class TokenMonitorPlugin(Star):
             "Token 水位监控插件已加载；警告启用=%s，目标会话=%s，"
             "检查间隔=%s 秒，页面刷新间隔=%s 毫秒",
             self.config.get("alert_enabled", True),
-            self.config.get(
-                "alert_target_session",
-                "default:FriendMessage:256418297",
-            ),
+            self.config.get("alert_target_session", "") or "（未配置，不发送告警）",
             self.config.get("check_interval_sec", 60),
             self.config.get("refresh_interval_ms", 10000),
         )
@@ -98,6 +108,51 @@ class TokenMonitorPlugin(Star):
                 await self._check_and_alert()
             except Exception as exc:
                 logger.error("Token 水位警告检查失败: %s", exc)
+
+    @staticmethod
+    def _resolve_core_db_path(context) -> str:
+        """向 AstrBot 框架索取核心数据库 data_v4.db 的真实路径。
+
+        AstrBot 的 BaseDatabase 初始化时就把自己的 DATABASE_URL 存好了，
+        形如 sqlite+aiosqlite:///C:/xxx/data_v4.db。直接读这个字段，
+        比自己推断目录结构可靠得多——用户怎么部署都不影响。
+
+        拿不到时才回落到部署结构推断；推断也失败就返回空串，
+        由调用方给出可读的报错，而不是静默指向一个不存在的路径。
+        """
+        try:
+            db = context.get_db()
+            url = str(getattr(db, "DATABASE_URL", "") or "")
+            if url:
+                for prefix in (
+                    "sqlite+aiosqlite:///",
+                    "sqlite+aiosqlite://",
+                    "sqlite:///",
+                    "sqlite://",
+                ):
+                    if url.startswith(prefix):
+                        raw = url[len(prefix):]
+                        candidate = Path(raw).expanduser()
+                        if candidate.is_file():
+                            logger.info("核心数据库路径由框架提供：%s", candidate)
+                            return str(candidate)
+                        break
+        except Exception as exc:
+            logger.debug("向框架索取 DATABASE_URL 失败: %s", exc)
+
+        base = Path(__file__).resolve().parents[2]
+        for candidate in (
+            base / "data_v4.db",
+            base.parent / "data_v4.db",
+            base.parent.parent / "data_v4.db",
+        ):
+            if candidate.is_file():
+                logger.info("核心数据库路径由部署结构推断：%s", candidate)
+                return str(candidate)
+
+        logger.warning("未能定位 AstrBot 核心数据库 data_v4.db")
+        return ""
+
 
     @staticmethod
     def _history_database_path() -> Path:
@@ -310,7 +365,7 @@ class TokenMonitorPlugin(Star):
                 for pref_row in connection.execute(
                     "SELECT scope_id, value FROM preferences WHERE key = 'sel_conv_id' AND scope = 'umo'"
                 ).fetchall():
-                    if pref_row["scope_id"] == MAIN_USER_ID:
+                    if pref_row["scope_id"] == self._resolve_main_user_id():
                         try:
                             current_main_conv = json.loads(pref_row["value"]).get(
                                 "val"
@@ -349,19 +404,16 @@ class TokenMonitorPlugin(Star):
                 row
                 for row in rows
                 if row["platform_id"] == MAIN_PLATFORM_ID
-                and row["user_id"] == MAIN_USER_ID
+                and row["user_id"] == self._resolve_main_user_id()
                 and row["conversation_id"] == current_main_conv
             ]
 
         alert_step_pct = self.config.get("alert_step_pct", 5)
-        session_str = self.config.get(
-            "alert_target_session", "default:FriendMessage:256418297"
-        )
-        context_limit = self._resolve_context_limit()
-        compress_threshold_tokens = (
-            context_limit * COMPRESS_THRESHOLD_PCT // 100
-        )
-
+        session_str = str(self.config.get("alert_target_session", "") or "").strip()
+        if not session_str:
+            # 未配置告警目标：跳过推送，只在页面展示水位
+            logger.debug("未配置 alert_target_session，本次跳过告警推送")
+            return
         # 轮数告警配置（v0.1.2）
         turn_config = self._resolve_turn_config()
         turn_alert_enabled = bool(self.config.get("turn_alert_enabled", True))
@@ -374,7 +426,15 @@ class TokenMonitorPlugin(Star):
                 continue
 
             conversation_id = row["conversation_id"]
-            title = row["title"] or conversation_id[:8]
+            # 展示名：title 为空时从 user_id 解析，避免历史记录里出现裸 ID
+            title = self._resolve_display_name(row["title"], row["user_id"])
+            # 按该会话实际生效的 provider 计算上限（跟随会话级热切换）
+            context_limit = self._resolve_context_limit(
+                row["user_id"], str(row["conversation_id"] or "")
+            )
+            compress_threshold_tokens = (
+                context_limit * COMPRESS_THRESHOLD_PCT // 100
+            )
             percent = round(token_usage / context_limit * 100, 2)
             state = self._alert_state.setdefault(
                 conversation_id,
@@ -561,7 +621,9 @@ class TokenMonitorPlugin(Star):
             event.stop_event()
             return
 
-        context_limit = self._resolve_context_limit()
+        context_limit = self._resolve_context_limit(
+            str(event.session), str(row["conversation_id"] or "")
+        )
         token_usage = row["token_usage"] or 0
         percent = round(token_usage / context_limit * 100, 2)
         turn_config = self._resolve_turn_config()
@@ -616,18 +678,61 @@ class TokenMonitorPlugin(Star):
                         sel_val = None
                     if sel_val:
                         active_by_scope[pref_row["scope_id"]] = sel_val
-                    if pref_row["scope_id"] == MAIN_USER_ID:
+                    if pref_row["scope_id"] == self._resolve_main_user_id():
                         current_main_conv = sel_val
 
             conversations = []
             stale_days = int(self.config.get("stale_days", DEFAULT_STALE_DAYS) or 0)
-            context_limit = self._resolve_context_limit()
             turn_config = self._resolve_turn_config()
-            compress_threshold_tokens = (
-                context_limit * COMPRESS_THRESHOLD_PCT // 100
-            )
+            main_context_limit = None
+            main_conv_id = ""
+
+            # 一次性取每个会话最近一次真实调用的 provider，避免循环里逐个查库
+            latest_provider: dict[str, str] = {}
+            try:
+                with closing(self._open_readonly_database()) as pconn:
+                    for prow in pconn.execute(
+                        "SELECT ps.conversation_id AS cid, ps.provider_id AS pid "
+                        "FROM provider_stats ps "
+                        "INNER JOIN ("
+                        "  SELECT conversation_id, MAX(start_time) AS mt "
+                        "  FROM provider_stats GROUP BY conversation_id"
+                        ") t ON ps.conversation_id = t.conversation_id "
+                        "   AND ps.start_time = t.mt"
+                    ).fetchall():
+                        if prow["cid"]:
+                            latest_provider[str(prow["cid"])] = str(prow["pid"] or "")
+            except Exception as exc:
+                logger.debug("批量读取会话最近 provider 失败: %s", exc)
+
+            # provider_id → model 名 的映射（用于卡片上显示短名）
+            provider_models: dict[str, str] = {}
+            try:
+                with open(self._cmd_config_path(), "r", encoding="utf-8-sig") as f:
+                    _cfg = json.load(f)
+                for _p in (_cfg.get("provider", []) or []):
+                    _pid = str(_p.get("id", "") or "")
+                    if _pid:
+                        provider_models[_pid] = str(_p.get("model", "") or "")
+            except Exception as exc:
+                logger.debug("读取 provider 模型名映射失败: %s", exc)
+
             for row in rows:
                 token_usage = max(0, int(row["token_usage"] or 0))
+                # 按该会话实际生效的 provider 计算上限（跟随会话级热切换）
+                context_limit = self._resolve_context_limit(
+                    row["user_id"], str(row["conversation_id"] or "")
+                )
+                compress_threshold_tokens = (
+                    context_limit * COMPRESS_THRESHOLD_PCT // 100
+                )
+                # 记录主会话的真实上限，供顶层 data.context_limit 返回
+                if row["user_id"] == self._resolve_main_user_id() and (
+                    current_main_conv is None
+                    or row["conversation_id"] == current_main_conv
+                ):
+                    main_context_limit = context_limit
+                    main_conv_id = str(row["conversation_id"] or "")
                 remaining_to_compress = max(
                     0, compress_threshold_tokens - token_usage
                 )
@@ -661,13 +766,20 @@ class TokenMonitorPlugin(Star):
                         ),
                         "is_main": (
                             row["platform_id"] == MAIN_PLATFORM_ID
-                            and row["user_id"] == MAIN_USER_ID
+                            and row["user_id"] == self._resolve_main_user_id()
                             and (
                                 current_main_conv is None
                                 or row["conversation_id"] == current_main_conv
                             )
                         ),
                         "turns": turns,
+                        "provider_id": latest_provider.get(
+                            str(row["conversation_id"] or ""), ""
+                        ),
+                        "model_name": provider_models.get(
+                            latest_provider.get(str(row["conversation_id"] or ""), ""),
+                            "",
+                        ),
                         "created_at": row["created_at"],
                         "updated_at": row["updated_at"],
                     }
@@ -678,7 +790,10 @@ class TokenMonitorPlugin(Star):
                     "status": "ok",
                     "message": "",
                     "data": {
-                        "context_limit": context_limit,
+                        "context_limit": main_context_limit
+                        or self._resolve_context_limit(
+                            self._resolve_main_user_id(), str(main_conv_id or "")
+                        ),
                         "compress_threshold_pct": COMPRESS_THRESHOLD_PCT,
                         "alert_threshold_pct": ALERT_THRESHOLD_PCT,
                         "turn_config": turn_config,
@@ -821,35 +936,109 @@ class TokenMonitorPlugin(Star):
         """AstrBot 主配置文件路径（插件部署目录 parents[2] 为 data/）"""
         return Path(__file__).resolve().parents[2] / "cmd_config.json"
 
-    def _resolve_context_limit(self) -> int:
-        """上下文限制（自动探测，纯检测不写死任何模型值）。
-        与 AstrBot 主 agent 的判定顺序保持一致（源码 @1678）：
-        ① 插件自身 context_limit(用户显式指定) > ② 默认 provider 的
-            max_context_tokens(用户手改) > ③ LLM_METADATAS[model](模型默认，
-            AstrBot 实际用的) > ④ provider_settings.fallback_max_context_tokens
-            (兜底值，仅当模型查不到默认时才用) > ⑤ 内置 128000。
-        用户显式设置优先，模型默认次之，兜底值只兜查不到的；随换模型自动跟。
+    def _resolve_context_limit(
+        self, umo: str | None = None, conversation_id: str = ""
+    ) -> int:
+        """上下文限制（自动探测，不写死任何模型值）。
+
+        判定顺序（不依赖任何第三方插件，装没装热切换都能用）：
+        ① 插件自身 context_limit（用户显式指定）
+        ② provider_stats 表：该会话最近一次真实调用用的 provider_id
+           —— AstrBot 核心每次调用后都会写这条记录，是最可信的实况，
+              无论模型是通过热切换插件、/provider 命令还是改全局配置换的
+        ③ preferences 表：会话级 provider_perf_chat_completion
+           —— 装了热切换插件或用过 /provider 命令才有，作为补充
+        ④ 全局默认 provider（agent_runner.config.model.provider_id）
+        ⑤ LLM_METADATAS 模型默认
+        ⑥ compression.fallback_max_tokens
+        ⑦ 内置 128000
+
+        所有取值都来自配置文件或数据库，不读任何内存快照，避免
+        「运行期改过 max_context_tokens 但读到的还是旧值」。
         """
         cfg_limit = int(self.config.get("context_limit", 0) or 0)
         if cfg_limit > 0:
             return cfg_limit
+
+        # ② 从 provider_stats 取该会话最近一次真实调用的 provider_id
+        stats_provider_id = ""
+        if conversation_id:
+            try:
+                with closing(self._open_readonly_database()) as conn:
+                    row = conn.execute(
+                        "SELECT provider_id FROM provider_stats "
+                        "WHERE conversation_id = ? "
+                        "AND COALESCE(provider_id, '') <> '' "
+                        "ORDER BY start_time DESC LIMIT 1",
+                        (conversation_id,),
+                    ).fetchone()
+                    if row is not None:
+                        stats_provider_id = str(row["provider_id"]).strip()
+            except Exception as exc:
+                logger.debug("从 provider_stats 解析 provider 失败: %s", exc)
+
+        # ③ preferences 表（兼容热切换插件 / /provider 命令）
+        pref_provider_id = ""
+        if umo:
+            try:
+                with closing(self._open_readonly_database()) as conn:
+                    row = conn.execute(
+                        "SELECT value FROM preferences "
+                        "WHERE scope = 'umo' AND scope_id = ? AND key = ?",
+                        (umo, "provider_perf_chat_completion"),
+                    ).fetchone()
+                    if row is not None and row["value"]:
+                        raw = str(row["value"])
+                        try:
+                            parsed = json.loads(raw)
+                            pref_provider_id = str(
+                                (parsed.get("val") if isinstance(parsed, dict) else parsed)
+                                or ""
+                            ).strip()
+                        except Exception:
+                            pref_provider_id = raw.strip()
+            except Exception as exc:
+                logger.debug("读取会话级 provider 失败: %s", exc)
+
+        # ④~⑦ 读配置文件
         try:
             with open(self._cmd_config_path(), "r", encoding="utf-8-sig") as f:
                 cmd = json.load(f)
-            ps = cmd.get("provider_settings", {})
-            default_id = ps.get("default_provider_id", "")
-            provider = next(
-                (p for p in cmd.get("provider", []) if p.get("id") == default_id),
-                None,
-            )
-            if provider is not None:
-                mct = int(provider.get("max_context_tokens", 0) or 0)
+            providers = cmd.get("provider", []) or []
+
+            def _mct_by_id(pid: str) -> int:
+                if not pid:
+                    return 0
+                cfg = next((p for p in providers if p.get("id") == pid), None)
+                if cfg is None:
+                    return 0
+                return int(cfg.get("max_context_tokens", 0) or 0)
+
+            # 实况优先：provider_stats → preferences
+            for pid in (stats_provider_id, pref_provider_id):
+                mct = _mct_by_id(pid)
                 if mct > 0:
+                    if pid == stats_provider_id and pid:
+                        logger.debug("上下文上限取自实况记录：%s → %s", pid, mct)
                     return mct
-            if provider is not None:
-                model = provider.get("model") or ""
+
+            # ④ 全局默认
+            ar_cfg = (cmd.get("agent_runner") or {}).get("config") or {}
+            global_id = str((ar_cfg.get("model") or {}).get("provider_id") or "").strip()
+            mct = _mct_by_id(global_id)
+            if mct > 0:
+                return mct
+
+            # ⑤ LLM_METADATAS
+            if global_id:
+                prov_cfg = next(
+                    (p for p in providers if p.get("id") == global_id), None
+                )
+                model = (prov_cfg or {}).get("model") or ""
                 if model:
                     try:
+                        # 注：这是 AstrBot 内部模块（非 astrbot.api），
+                        # 版本升级可能挪动位置。已包 try/except，取不到就跳过。
                         from astrbot.core.utils.llm_metadata import LLM_METADATAS
                         info = LLM_METADATAS.get(model)
                         if (
@@ -860,27 +1049,46 @@ class TokenMonitorPlugin(Star):
                             return int(info["limit"]["context"])
                     except Exception:
                         pass
-            fallback = int(ps.get("fallback_max_context_tokens", 0) or 0)
+
+            # ⑥ fallback
+            fallback = int(
+                ((ar_cfg.get("compression") or {}).get("fallback_max_tokens", 0)) or 0
+            )
             if fallback > 0:
                 return fallback
             return 128000
         except Exception as exc:
             logger.warning("读取上下文限制失败，使用默认 1M: %s", exc)
             return CONTEXT_LIMIT
-
     def _resolve_turn_config(self) -> dict:
-        """轮数截断配置：策略 / 最大轮数 / 每次移除轮数。"""
+        """轮数截断配置：策略 / 最大轮数 / 每次移除轮数。
+
+        2026-11-16 重构：AstrBot 已把压缩相关项从 provider_settings 迁到
+        agent_runner.config.compression，旧位置恒为 null，导致策略永远显示默认值。
+        字段映射：overflow_strategy → strategy，max_turns → max_turns，
+        trim_turns → dequeue_turns。
+        """
+        default = {"strategy": "llm_compress", "max_turns": -1, "dequeue_turns": 10}
         try:
             with open(self._cmd_config_path(), "r", encoding="utf-8-sig") as f:
                 cmd = json.load(f)
-            ps = cmd.get("provider_settings", {})
+            ar_cfg = ((cmd.get("agent_runner") or {}).get("config")) or {}
+            comp = ar_cfg.get("compression") or {}
+            if comp:
+                return {
+                    "strategy": str(comp.get("overflow_strategy") or "llm_compress"),
+                    "max_turns": int(comp.get("max_turns", -1) or -1),
+                    "dequeue_turns": int(comp.get("trim_turns", 10) or 10),
+                }
+            # 老版本兜底：仍读 provider_settings
+            ps = cmd.get("provider_settings") or {}
             return {
                 "strategy": ps.get("context_limit_reached_strategy", "llm_compress"),
                 "max_turns": int(ps.get("max_context_length", -1) or -1),
                 "dequeue_turns": int(ps.get("dequeue_context_length", 10) or 10),
             }
         except Exception:
-            return {"strategy": "llm_compress", "max_turns": -1, "dequeue_turns": 10}
+            return default
 
     @staticmethod
     def _stale_age_days(updated_at: str) -> int:
@@ -909,27 +1117,102 @@ class TokenMonitorPlugin(Star):
 
     @staticmethod
     def _resolve_display_name(title, user_id):
-        """会话展示名：title 优先，空则从 user_id 解析（群聊 → 群 xxx）。"""
+        """会话展示名：title 优先，空则从 user_id 解析。
+
+        2026-11-16 增强：AstrBot 的 conversations.title 常年为 NULL，
+        旧实现会一路退化到裸 QQ 号，导致告警历史里标题全是数字、无法对号。
+        这里改为按会话类型给出可读标签，并附带可辨识的短后缀。
+        """
         if title and str(title).strip():
             return str(title)
-        parts = str(user_id or "").split(":")
-        if len(parts) >= 3 and "Group" in parts[1]:
-            return f"群 {parts[-1]}"
-        if len(parts) >= 2:
+
+        raw = str(user_id or "").strip()
+        if not raw:
+            return "未命名会话"
+
+        parts = raw.split(":")
+        # 形如 default:FriendMessage:<QQ> / default:GroupMessage:<群号>
+        if len(parts) >= 3:
+            msg_type, ident = parts[1], parts[-1]
+            if "Group" in msg_type:
+                return f"群 {ident}"
+            if "Friend" in msg_type:
+                return f"私聊 {ident}"
+            if "Guild" in msg_type or "Channel" in msg_type:
+                return f"频道 {ident}"
+            return f"{msg_type} {ident}"
+        if len(parts) == 2:
             return parts[-1]
-        return str(user_id or "未命名会话")
+        return raw
+
+    @staticmethod
+    def _resolve_main_user_id() -> str:
+        """返回「主用户」的会话标识（形如 default:FriendMessage:<QQ>）。
+
+        优先级：
+        ① 插件配置 main_user_id（用户显式填写，最可信）
+        ② 自动推断：platform_id 匹配且 token_usage 最高的那条会话的 user_id
+
+        自动推断在只有一个活跃会话时是准的；一旦有多个（换过号、旧会话残留），
+        就可能判错，把告警发到不该发的地方。所以配置项说明里已明确建议显式填写。
+        """
+        if MAIN_USER_ID:
+            return MAIN_USER_ID
+        if _MAIN_USER_CACHE[0]:
+            return _MAIN_USER_CACHE[0]
+        try:
+            with closing(TokenMonitorPlugin._open_readonly_database()) as connection:
+                row = connection.execute(
+                    "SELECT user_id FROM conversations "
+                    "WHERE platform_id = ? AND COALESCE(user_id, '') <> '' "
+                    "ORDER BY COALESCE(token_usage, 0) DESC LIMIT 1",
+                    (MAIN_PLATFORM_ID,),
+                ).fetchone()
+                if row is not None and row["user_id"]:
+                    _MAIN_USER_CACHE[0] = str(row["user_id"])
+                    logger.info("未配置主用户标识，已按用量推断为：%s", _MAIN_USER_CACHE[0])
+                    return _MAIN_USER_CACHE[0]
+        except Exception as exc:
+            logger.debug("推断主用户标识失败: %s", exc)
+        return ""
+
 
     @staticmethod
     def _database_path() -> Path:
-        inferred_path = Path(__file__).resolve().parents[2] / "data_v4.db"
-        if inferred_path.is_file():
-            return inferred_path
-        if DEPLOYMENT_DATABASE_FALLBACK.is_file():
-            return DEPLOYMENT_DATABASE_FALLBACK
-        raise FileNotFoundError(
-            f"未找到 AstrBot 数据库（推算路径：{inferred_path}）"
-        )
+        """定位 AstrBot 核心数据库 data_v4.db。
 
+        优先级：
+        ① _CORE_DB_PATH —— 由 __init__ 向框架索取（BaseDatabase.DATABASE_URL），
+           这是最可靠的一档，与用户怎么部署无关
+        ② 部署结构推断：core/data/plugins/<plugin>/main.py → parents[2] 即 core/data
+        ③ 再向上两级兜底
+
+        全部失败时抛错，并把试过的路径一并列出，便于用户排查。
+        """
+        tried: list[str] = []
+
+        if _CORE_DB_PATH:
+            cached = Path(_CORE_DB_PATH)
+            if cached.is_file():
+                return cached
+            tried.append(f"{cached}（框架提供的路径）")
+
+        base = Path(__file__).resolve().parents[2]
+        for candidate in (
+            base / "data_v4.db",
+            base.parent / "data_v4.db",
+            base.parent.parent / "data_v4.db",
+        ):
+            tried.append(str(candidate))
+            if candidate.is_file():
+                return candidate
+
+        detail = "；".join(tried) if tried else "（无）"
+        raise FileNotFoundError(
+            f"未找到 AstrBot 核心数据库 data_v4.db。已尝试以下位置：{detail}。"
+            "本插件会优先向 AstrBot 框架索取数据库路径，若此处仍然报错，"
+            "通常意味着框架接口与插件版本不匹配，请提交 Issue 并附上本段报错。"
+        )
     @classmethod
     def _open_readonly_database(cls) -> sqlite3.Connection:
         database_path = cls._database_path()
