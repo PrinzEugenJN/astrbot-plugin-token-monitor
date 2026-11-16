@@ -5,9 +5,11 @@
     "default": true
   },
   "alert_target_session": {
-    "description": "警告发送目标会话",
+    "description": "告警推送的目标会话，留空则不推送。",
     "type": "string",
-    "default": "default:FriendMessage:256418297"
+    "default": "",
+    "hint": "格式：`default:FriendMessage:<QQ号>`\n\n**留空**时插件只在页面展示水位，不发送任何 QQ 消息。\n\n开启告警时建议填写，否则永远收不到推送。",
+    "obvious_hint": true
   },
   "check_interval_sec": {
     "description": "后端水位检查间隔（秒）",
@@ -58,5 +60,12 @@
     "description": "会话冻结多少天后标记为旧会话（0=不标记）",
     "type": "int",
     "default": 30
+  },
+  "main_user_id": {
+    "type": "string",
+    "description": "主用户会话标识，决定哪个会话被标为「主会话」。",
+    "default": "",
+    "hint": "格式：`default:FriendMessage:<QQ号>`\n\n**留空**：按 Token 用量最高的会话自动判定。只有一个活跃会话时准确；有多个时（换过号、旧会话残留）可能判错。\n\n**建议显式填写**。填了之后星标、告警目标、趋势图默认焦点都会指向这个会话。\n\n无论填不填，都不影响水位数据的采集与展示。",
+    "obvious_hint": true
   }
 }
