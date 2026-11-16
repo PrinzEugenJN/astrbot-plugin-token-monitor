@@ -6,8 +6,6 @@
   const COMPRESS_THRESHOLD_PCT = 82;
   const ALERT_THRESHOLD_PCT = 75;
   const POLL_INTERVAL_MS = 10_000;
-  const MAIN_PLATFORM_ID = "default";
-  const MAIN_USER_ID = "default:FriendMessage:256418297";
 
   const numberFormatter = new Intl.NumberFormat("zh-CN");
   const state = {
@@ -126,8 +124,19 @@
   }
 
   function formatDateTime(value) {
-    const date = parseDate(value);
-    if (!date) return "未知";
+    // 2026-11-16 修复：后端 alert_history.created_at 是秒级浮点时间戳，
+    // 调用方乘 1000 后传入 number。旧实现只走 parseDate（面向 ISO 字符串），
+    // 会把 "1763274822879" 改写成 "1763274822879Z" 而解析失败，一律显示“未知”。
+    let date = null;
+    if (typeof value === "number" && Number.isFinite(value)) {
+      date = new Date(value);
+    } else if (typeof value === "string" && /^\d{10,13}(\.\d+)?$/.test(value.trim())) {
+      const num = Number(value.trim());
+      date = new Date(num < 1e12 ? num * 1000 : num);
+    } else {
+      date = parseDate(value);
+    }
+    if (!date || Number.isNaN(date.getTime())) return "未知";
     return new Intl.DateTimeFormat("zh-CN", {
       month: "2-digit",
       day: "2-digit",
@@ -194,10 +203,13 @@
         Boolean(item?.over_compress_threshold) ||
         percent >= COMPRESS_THRESHOLD_PCT,
       alerting: Boolean(item?.alerting) || percent >= ALERT_THRESHOLD_PCT,
-      isMain:
-        Boolean(item?.is_main) ||
-        (item?.platform_id === MAIN_PLATFORM_ID && item?.user_id === MAIN_USER_ID),
+        // 主会话判定完全交给后端：后端会结合插件配置的 main_user_id，
+        // 未配置时按 Token 用量最高的会话推断。前端不再持有写死的会话标识。
+        isMain: Boolean(item?.is_main),
       turns: Math.max(0, asNumber(item?.turns)),
+      // 当前会话实际在用的模型：provider_id 是完整标识，model_name 是短名
+      providerId: String(item?.provider_id || ""),
+      modelName: String(item?.model_name || ""),
       updatedAt: item?.updated_at,
       status: String(item?.status || "active"),
     };
@@ -239,9 +251,20 @@
 
     const displayedPercent = Math.min(100, conversation.percent);
     const waterState = getWaterState(conversation.percent);
-    dom.focusTitle.textContent = conversation.isMain
+    const focusName = conversation.isMain
       ? `⭐ ${conversation.displayName}`
       : conversation.displayName;
+    dom.focusTitle.textContent = conversation.modelName
+      ? `${focusName} · ${conversation.modelName}`
+      : focusName;
+    // 完整信息放进 title，长名截断后仍可悬停查看
+    if (conversation.modelName) {
+      dom.focusTitle.title = `${conversation.displayName} · ${
+        conversation.providerId || conversation.modelName
+      }`;
+    } else {
+      dom.focusTitle.removeAttribute("title");
+    }
     animateNumber(
       dom.mainTokenUsage,
       state.lastMainToken,
@@ -321,11 +344,18 @@
           ? `⭐ ${conversation.displayName}`
           : `${statusPrefix}${conversation.displayName}`,
       ),
-      createElement(
-        "div",
-        "card-meta",
-        `${conversation.platformId} · ${conversation.userId}`,
-      ),
+      (() => {
+        const metaText = conversation.modelName
+          ? conversation.modelName
+          : `${conversation.platformId} · ${conversation.userId}`;
+        const metaEl = createElement("div", "card-meta", metaText);
+        // 模型名过长时靠 CSS 截断，完整名放进 title 悬停可见
+        if (conversation.modelName) {
+          metaEl.title = conversation.providerId || conversation.modelName;
+          metaEl.classList.add("card-meta-model");
+        }
+        return metaEl;
+      })(),
     );
     top.append(
       nameWrap,
