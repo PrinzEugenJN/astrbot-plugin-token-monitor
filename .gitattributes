@@ -1,0 +1,38 @@
+# 行尾符统一策略
+#
+# text=auto        由 git 自动判断哪些是文本文件
+# eol=crlf         检出到 Windows 工作区时统一用 CRLF
+# binary           二进制文件，不做任何行尾转换
+#
+# 目的：无论用什么编辑器、什么工具写文件，仓库内保持一致，
+#       工作区也保持一致，不再出现 "LF will be replaced by CRLF" 的警告。
+
+* text=auto
+
+# 文本文件：明确声明，工作区统一 CRLF
+*.py            text eol=crlf
+*.md            text eol=crlf
+*.yaml          text eol=crlf
+*.yml           text eol=crlf
+*.json          text eol=crlf
+*.txt           text eol=crlf
+*.js            text eol=crlf
+*.css           text eol=crlf
+*.html          text eol=crlf
+.gitignore      text eol=crlf
+.gitattributes  text eol=crlf
+
+# 二进制文件：禁止任何转换
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.webp          binary
+*.zip           binary
+*.7z            binary
+*.exe           binary
+*.dll           binary
+*.so            binary
+*.db            binary
+*.pyc           binary
