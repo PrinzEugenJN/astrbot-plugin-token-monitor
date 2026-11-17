@@ -1,10 +1,36 @@
-__pycache__/
-*.pyc
-*.pyo
-.irmia/
-backup/
-deploy_bak_*/
-*.log
-.DS_Store
+# ---- 备份与临时文件 ----
+*.bak_*
+*.bak
+*.old
 *.tmp
 .*.tmp
+
+# ---- 部署脚本产物 ----
+backup/
+deploy_bak_*/
+.irmia/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+
+# ---- 运行时数据（插件自己生成，不进版本库）----
+*.log
+logs/
+alert_history.db
+watch_state.json
+sync_log.jsonl
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
